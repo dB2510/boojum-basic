@@ -1,0 +1,9 @@
+[package]
+name = "boojum-sha256"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boojum = { git = "https://github.com/matter-labs/era-boojum.git", branch = "main", version = "0.1.0" }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
