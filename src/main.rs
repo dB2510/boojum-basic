@@ -1,9 +1,8 @@
-use std::{str::FromStr, hash::BuildHasher};
-use std::simd;
+use boojum::gadgets::u8::UInt8;
 use boojum::{
     algebraic_props::round_function::AbsorptionModeOverwrite,
     algebraic_props::sponge::GoldilocksPoseidonSponge, config::SetupCSConfig,
-    field::goldilocks::{GoldilocksExt2, GoldilocksField}, gadgets::{sha256::sha256, tables::{create_tri_xor_table, TriXor4Table, create_maj4_table, create_ch4_table, Ch4Table, Maj4Table, create_4bit_chunk_split_table, Split4BitChunkTable}}, worker::Worker,
+    field::goldilocks::GoldilocksField, gadgets::{sha256::sha256, tables::{create_tri_xor_table, TriXor4Table, create_maj4_table, create_ch4_table, Ch4Table, Maj4Table, create_4bit_chunk_split_table, Split4BitChunkTable}}, worker::Worker,
     cs::{
         gates::{ConstantsAllocatorGate, NopGate, ReductionGate, FmaGateInBaseFieldWithoutConstant},
         implementations::{
@@ -26,7 +25,7 @@ fn main() {
     type TreeHash = GoldilocksPoseidonSponge<AbsorptionModeOverwrite>;
     type Transcript = GoldilocksPoisedonTranscript;
 
-    let sample: String = String::from_str("Welcome to the world of boojum");
+    let sample: String = "Welcome to the world of boojum".to_string();
     let payload = sample.into_bytes();
 
     let worker = Worker::new_with_num_threads(8);
