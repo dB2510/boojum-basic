@@ -1,9 +1,10 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use zkevm_test_harness::proof_wrapper_utils::{wrap_proof, WrapperConfig};
+use circuit_definitions::circuit_definitions::recursion_layer::{ZkSyncRecursionLayerProof, ZkSyncRecursionLayerStorage, ZkSyncRecursionLayerVerificationKey};
 use boojum::{
     algebraic_props::round_function::AbsorptionModeOverwrite,
-    algebraic_props::sponge::GoldilocksPoseidonSponge,
     config::{
         SetupCSConfig,
         ProvingCSConfig,
@@ -34,7 +35,7 @@ use boojum::{
         },
         implementations::{
             prover::ProofConfig,
-            transcript::GoldilocksPoisedonTranscript,
+            transcript::GoldilocksPoisedon2Transcript,
         },
         cs_builder::*,
         cs_builder_verifier::CsVerifierBuilder,
@@ -50,12 +51,13 @@ use boojum::{
     },
     log
 };
+use boojum::algebraic_props::sponge::GoldilocksPoseidon2Sponge;
 
 type F = GoldilocksField;
 
 fn main() {
-    type T = GoldilocksPoseidonSponge<AbsorptionModeOverwrite>;
-    type TR = GoldilocksPoisedonTranscript;
+    type T = GoldilocksPoseidon2Sponge<AbsorptionModeOverwrite>;
+    type TR = GoldilocksPoisedon2Transcript;
 
     let sample: String = "Welcome to the world of boojum".to_string();
     let payload = sample.into_bytes();
@@ -188,7 +190,14 @@ fn main() {
         (),
     );
 
-    let serialized_proof = match bincode::serialize(&proof) {
+    // Wrap FRI proof as snark to verify with the help of era-boojum-validator-cli.
+    let zkproof: ZkSyncRecursionLayerProof = ZkSyncRecursionLayerStorage::from_inner(1, proof.clone());
+    let zkvk: ZkSyncRecursionLayerVerificationKey = ZkSyncRecursionLayerStorage::from_inner(1, vk.clone());
+    let wrap_config = WrapperConfig::new(1);
+
+    let (wrapped_proof, wrapped_vk) = wrap_proof(zkproof, zkvk, wrap_config);
+
+    let serialized_proof = match bincode::serialize(&wrapped_proof) {
         Ok(sz) => sz,
         Err(err) => {
             panic!("couldn't serialize proof {}", err.to_string())
@@ -196,7 +205,7 @@ fn main() {
     };
 
     // Specify the file name
-    let proof_path = Path::new("proof.bin");
+    let proof_path = Path::new("wrapped_proof.bin");
     let display = proof_path.display();
 
     // Open a file in write-only mode, returns `io::Result<File>`
@@ -211,12 +220,12 @@ fn main() {
         Ok(_) => println!("successfully wrote to {}", display),
     }
 
-    let serialized_vk = match serde_json::to_string(&vk) {
+    let serialized_vk = match serde_json::to_string(&wrapped_vk) {
         Ok(k) => k,
         Err(err) => panic!("couldn't serialize verification key: {}", err.to_string())
     };
 
-    let vk_path = Path::new("vk.json");
+    let vk_path = Path::new("wrapped_vk.json");
     let display = vk_path.display();
 
     let mut file = match File::create(&vk_path) {
