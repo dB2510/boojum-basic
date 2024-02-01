@@ -1,244 +1,110 @@
-use std::fs::File;
-use std::io::Write;
-use std::path::Path;
-use zkevm_test_harness::proof_wrapper_utils::{wrap_proof, WrapperConfig};
-use circuit_definitions::circuit_definitions::recursion_layer::{ZkSyncRecursionLayerProof, ZkSyncRecursionLayerStorage, ZkSyncRecursionLayerVerificationKey};
-use boojum::{
-    algebraic_props::round_function::AbsorptionModeOverwrite,
-    config::{
-        SetupCSConfig,
-        ProvingCSConfig,
-    },
-    field::goldilocks::GoldilocksField,
-    field::goldilocks::GoldilocksExt2,
-    gadgets::{
-        sha256::sha256,
-        tables::{
-            create_tri_xor_table,
-            TriXor4Table,
-            create_maj4_table,
-            create_ch4_table,
-            Ch4Table,
-            Maj4Table,
-            create_4bit_chunk_split_table,
-            Split4BitChunkTable,
-        },
-        u8::UInt8,
-    },
-    worker::Worker,
-    cs::{
-        gates::{
-            ConstantsAllocatorGate,
-            NopGate,
-            ReductionGate,
-            FmaGateInBaseFieldWithoutConstant,
-        },
-        implementations::{
-            prover::ProofConfig,
-            transcript::GoldilocksPoisedon2Transcript,
-        },
-        cs_builder::*,
-        cs_builder_verifier::CsVerifierBuilder,
-        implementations::pow::NoPow,
-        cs_builder_reference::*,
-        GateConfigurationHolder,
-        StaticToolboxHolder,
-        traits::{
-            gate::GatePlacementStrategy,
-            cs::ConstraintSystem
-        },
-        LookupParameters::UseSpecializedColumnsWithTableIdAsConstant, CSGeometry,
-    },
-    log
-};
-use boojum::algebraic_props::sponge::GoldilocksPoseidon2Sponge;
+// Proving a simple circuit with the following operations:
+// y = x + A;
+// z = y * B;
+// w = if y > z { z } else { y }, Min(y, z)
+// where A and B are constants and x is input.
+// This code snippet is taken from: https://github.com/matter-labs/zksync-era/blob/main/docs/guides/advanced/deeper_overview.md#deeper-overview
 
-type F = GoldilocksField;
+use boojum::algebraic_props::round_function::AbsorptionModeOverwrite;
+use boojum::algebraic_props::sponge::GoldilocksPoseidonSponge;
+use boojum::config::DevCSConfig;
+use boojum::cs::cs_builder::{CsBuilder, CsBuilderImpl, new_builder};
+use boojum::cs::{CSGeometry, GateConfigurationHolder, StaticToolboxHolder};
+use boojum::cs::cs_builder_reference::CsReferenceImplementationBuilder;
+use boojum::cs::cs_builder_verifier::CsVerifierBuilder;
+use boojum::cs::gates::{FmaGateInBaseFieldWithoutConstant, NopGate, SelectionGate};
+use boojum::cs::implementations::pow::NoPow;
+use boojum::cs::implementations::prover::ProofConfig;
+use boojum::cs::implementations::transcript::GoldilocksPoisedonTranscript;
+use boojum::cs::traits::cs::ConstraintSystem;
+use boojum::cs::traits::gate::GatePlacementStrategy;
+use boojum::field::goldilocks::{GoldilocksExt2, GoldilocksField};
+use boojum::field::{Field, U64Representable};
+use boojum::gadgets::traits::witnessable::WitnessHookable;
+use boojum::gadgets::u16::UInt16;
+use boojum::log;
+use boojum::worker::Worker;
 
 fn main() {
-    type T = GoldilocksPoseidon2Sponge<AbsorptionModeOverwrite>;
-    type TR = GoldilocksPoisedon2Transcript;
+    type P = GoldilocksField;
+    type F = GoldilocksField;
 
-    let sample: String = "Welcome to the world of boojum".to_string();
-    let payload = sample.into_bytes();
+    let geometry = CSGeometry {
+        num_columns_under_copy_permutation: 8,
+        num_witness_columns: 0,
+        num_constant_columns: 2,
+        max_allowed_constraint_degree: 8,
+    };
 
-    let worker = Worker::new_with_num_threads(8);
+    let max_variables = 512;
+    let max_trace_len = 128;
 
-    let quotient_lde_degree = 8; // Setup params are not split yet, so it's should be equal to max(FRI lde degree, quotient degree)
-    let fri_lde_degree = 8;
-    let cap_size = 16;
-    let prover_config = ProofConfig {
-        fri_lde_factor: fri_lde_degree,
-        pow_bits: 0, // not important in practice for anything. 2^20 Blake2s POW uses 30ms
+    // Configures the given builder by providing the gates needed to build the circuit.
+    fn configure<
+        T: CsBuilderImpl<F, T>,
+        GC: GateConfigurationHolder<F>,
+        TB: StaticToolboxHolder,
+    >(
+        builder: CsBuilder<T, F, GC, TB>,
+    ) -> CsBuilder<T, F, impl GateConfigurationHolder<F>, impl StaticToolboxHolder> {
+        let builder = FmaGateInBaseFieldWithoutConstant::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+        let builder = SelectionGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns
+        );
+        let builder = NopGate::configure_builder(
+            builder,
+            GatePlacementStrategy::UseGeneralPurposeColumns,
+        );
+
+        builder
+    }
+
+    let builder_impl = CsReferenceImplementationBuilder::<F, P, DevCSConfig>::new(
+        geometry,
+        max_variables,
+        max_trace_len,
+    );
+    let builder = new_builder::<_, F>(builder_impl);
+
+    let builder = configure(builder);
+    let mut cs = builder.build(());
+
+    // Add witnesses to the constraint system with evaluations.
+    let one = cs.alloc_single_variable_from_witness(GoldilocksField::from_u64_unchecked(1));
+    let zero = cs.alloc_single_variable_from_witness(GoldilocksField::from_u64_unchecked(0));
+    let x = cs.alloc_single_variable_from_witness(GoldilocksField::from_u64_unchecked(7));
+    let a = cs.alloc_single_variable_from_witness(GoldilocksField::from_u64_unchecked(2));
+    let b = cs.alloc_single_variable_from_witness(GoldilocksField::from_u64_unchecked(3));
+    let y = FmaGateInBaseFieldWithoutConstant::compute_fma(&mut cs, F::ONE, (x, one), F::ONE, a);
+    let z = FmaGateInBaseFieldWithoutConstant::compute_fma(&mut cs, F::ONE, (y, b), F::ONE, zero);
+
+    // TODO(dhruv): Figure how to compute selector flag for SelectionGate.
+    let w = SelectionGate::select(&mut cs, y, z, zero);
+    let result = unsafe { UInt16::from_variable_unchecked(w) };
+    log!("Result of the circuit: {}", result.witness_hook(&cs)().unwrap());
+
+    cs.pad_and_shrink();
+
+    let worker = Worker::new_with_num_threads(1);
+    let cs = cs.into_assembly();
+
+    let lde_factor_to_use = 32;
+    let proof_config = ProofConfig {
+        fri_lde_factor: lde_factor_to_use,
+        pow_bits: 0,
         ..Default::default()
     };
 
-    // TODO: perform satisfiability check
-
-    let geometry = CSGeometry {
-        num_columns_under_copy_permutation: 60,
-        num_witness_columns: 0,
-        num_constant_columns: 4,
-        max_allowed_constraint_degree: 4,
-    };
-    let max_variables = 1 << 25;
-    let max_trace_len = 1 << 19;
-
-    type P = boojum::field::goldilocks::MixedGL;
-    let builder_impl = CsReferenceImplementationBuilder::<F, P, SetupCSConfig>::new(
-        geometry,
-        max_variables,
-        max_trace_len,
-    );
-    let builder = new_builder::<_, F>(builder_impl);
-
-    let builder = configure(builder);
-    let mut owned_cs = builder.build(());
-
-    // Add tables to the constraint system.
-    let table = create_tri_xor_table();
-    owned_cs.add_lookup_table::<TriXor4Table, 4>(table);
-
-    let table = create_ch4_table();
-    owned_cs.add_lookup_table::<Ch4Table, 4>(table);
-
-    let table = create_maj4_table();
-    owned_cs.add_lookup_table::<Maj4Table, 4>(table);
-
-    let table = create_4bit_chunk_split_table::<F, 1>();
-    owned_cs.add_lookup_table::<Split4BitChunkTable<1>, 4>(table);
-
-    let table = create_4bit_chunk_split_table::<F, 2>();
-    owned_cs.add_lookup_table::<Split4BitChunkTable<2>, 4>(table);
-
-    let mut circuit_input = vec![];
-
-    let cs = &mut owned_cs;
-
-    for el in payload.iter() {
-        let el = UInt8::allocate_checked(cs, *el);
-        circuit_input.push(el);
-    }
-
-    let _output = sha256(cs, &circuit_input);
-    drop(cs);
-    let (_, padding_hint) = owned_cs.pad_and_shrink();
-    let owned_cs = owned_cs.into_assembly();
-    owned_cs.print_gate_stats();
-
-    let (base_setup, setup, vk, setup_tree, vars_hint, wits_hint) =
-        owned_cs.get_full_setup::<T>(&worker, quotient_lde_degree, cap_size);
-
-    let builder_impl = CsReferenceImplementationBuilder::<F, P, ProvingCSConfig>::new(
-        geometry,
-        max_variables,
-        max_trace_len,
-    );
-
-    let builder = new_builder::<_, F>(builder_impl);
-    let builder = configure(builder);
-    let mut owned_cs = builder.build(());
-
-    // add tables
-    let table = create_tri_xor_table();
-    owned_cs.add_lookup_table::<TriXor4Table, 4>(table);
-
-    let table = create_ch4_table();
-    owned_cs.add_lookup_table::<Ch4Table, 4>(table);
-
-    let table = create_maj4_table();
-    owned_cs.add_lookup_table::<Maj4Table, 4>(table);
-
-    let table = create_4bit_chunk_split_table::<F, 1>();
-    owned_cs.add_lookup_table::<Split4BitChunkTable<1>, 4>(table);
-
-    let table = create_4bit_chunk_split_table::<F, 2>();
-    owned_cs.add_lookup_table::<Split4BitChunkTable<2>, 4>(table);
-
-    // create setup
-    let now = std::time::Instant::now();
-    log!("Start synthesis for proving");
-    let mut circuit_input = vec![];
-
-    let cs = &mut owned_cs;
-
-    for el in payload.iter() {
-        let el = UInt8::allocate_checked(cs, *el);
-        circuit_input.push(el);
-    }
-
-    let _output = sha256(cs, &circuit_input);
-    dbg!(now.elapsed());
-    log!("Synthesis for proving is done");
-    owned_cs.pad_and_shrink_using_hint(&padding_hint);
-    let mut owned_cs = owned_cs.into_assembly();
-
-    log!("Proving");
-    let witness_set = owned_cs.take_witness_using_hints(&worker, &vars_hint, &wits_hint);
-    log!("Witness is resolved");
-
-    let now = std::time::Instant::now();
-
-    let proof = owned_cs.prove_cpu_basic::<GoldilocksExt2, TR, T, NoPow>(
-        &worker,
-        witness_set,
-        &base_setup,
-        &setup,
-        &setup_tree,
-        &vk,
-        prover_config,
-        (),
-    );
-
-    // Wrap FRI proof as snark to verify with the help of era-boojum-validator-cli.
-    let zkproof: ZkSyncRecursionLayerProof = ZkSyncRecursionLayerStorage::from_inner(1, proof.clone());
-    let zkvk: ZkSyncRecursionLayerVerificationKey = ZkSyncRecursionLayerStorage::from_inner(1, vk.clone());
-    let wrap_config = WrapperConfig::new(1);
-
-    let (wrapped_proof, wrapped_vk) = wrap_proof(zkproof, zkvk, wrap_config);
-
-    let serialized_proof = match bincode::serialize(&wrapped_proof) {
-        Ok(sz) => sz,
-        Err(err) => {
-            panic!("couldn't serialize proof {}", err.to_string())
-        }
-    };
-
-    // Specify the file name
-    let proof_path = Path::new("wrapped_proof.bin");
-    let display = proof_path.display();
-
-    // Open a file in write-only mode, returns `io::Result<File>`
-    let mut file = match File::create(&proof_path) {
-        Err(why) => panic!("couldn't create {}: {}", display, why),
-        Ok(file) => file,
-    };
-
-    // Write the JSON string to the file, returns `io::Result<()>`
-    match file.write_all(&serialized_proof) {
-        Err(why) => panic!("couldn't write to {}: {}", display, why),
-        Ok(_) => println!("successfully wrote to {}", display),
-    }
-
-    let serialized_vk = match serde_json::to_string(&wrapped_vk) {
-        Ok(k) => k,
-        Err(err) => panic!("couldn't serialize verification key: {}", err.to_string())
-    };
-
-    let vk_path = Path::new("wrapped_vk.json");
-    let display = vk_path.display();
-
-    let mut file = match File::create(&vk_path) {
-        Err(why) => panic!("couldn't create {}: {}", display, why),
-        Ok(file) => file,
-    };
-
-    match file.write_all(serialized_vk.as_bytes()) {
-        Err(why) => panic!("couldn't write to {}: {}", display, why),
-        Ok(_) => println!("successfully wrote to {}", display),
-    };
-
-    log!("Proving is done, taken {:?}", now.elapsed());
+    let (proof, vk) = cs.prove_one_shot::<
+        GoldilocksExt2,
+        GoldilocksPoisedonTranscript,
+        GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
+        NoPow,
+    >(&worker, proof_config, ());
 
     let builder_impl = CsVerifierBuilder::<F, GoldilocksExt2>::new_from_parameters(geometry);
     let builder = new_builder::<_, F>(builder_impl);
@@ -246,39 +112,19 @@ fn main() {
     let builder = configure(builder);
     let verifier = builder.build(());
 
-    let is_valid = verifier.verify::<T, TR, NoPow>((), &vk, &proof);
+    let is_valid = verifier.verify::<
+        GoldilocksPoseidonSponge<AbsorptionModeOverwrite>,
+        GoldilocksPoisedonTranscript,
+        NoPow
+    >(
+        (),
+        &vk,
+        &proof,
+    );
+
     if is_valid {
-        log!("Proof verified, yayy 🎉")
+        log!("Proof verified, yayy 🎉");
     } else {
-        log!("Invalid proof, nayy 👎")
+        log!("Invalid proof, nayy 👎");
     }
-}
-
-fn configure<T: CsBuilderImpl<F, T>, GC: GateConfigurationHolder<F>, TB: StaticToolboxHolder>(
-    builder: CsBuilder<T, F, GC, TB>,
-) -> CsBuilder<T, F, impl GateConfigurationHolder<F>, impl StaticToolboxHolder> {
-    let num_lookups = 8;
-    let builder = builder.allow_lookup(
-        UseSpecializedColumnsWithTableIdAsConstant {
-            width: 4,
-            num_repetitions: num_lookups,
-            share_table_id: true,
-        },
-    );
-    let builder = ConstantsAllocatorGate::configure_builder(
-        builder,
-        GatePlacementStrategy::UseGeneralPurposeColumns,
-    );
-    let builder = FmaGateInBaseFieldWithoutConstant::configure_builder(
-        builder,
-        GatePlacementStrategy::UseGeneralPurposeColumns,
-    );
-    let builder = ReductionGate::<F, 4>::configure_builder(
-        builder,
-        GatePlacementStrategy::UseGeneralPurposeColumns,
-    );
-    let builder =
-        NopGate::configure_builder(builder, GatePlacementStrategy::UseGeneralPurposeColumns);
-
-    builder
 }
